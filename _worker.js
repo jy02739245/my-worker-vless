@@ -1,6 +1,9 @@
 import {
-	connect
+    connect
 } from 'cloudflare:sockets';
+
+// 常量定义
+const DNS_ENDPOINT = 'https://1.1.1.1/dns-query';
 
 // 重用编码器/解码器以避免每次请求都创建新的实例
 const te = new TextEncoder();
@@ -8,303 +11,438 @@ const td = new TextDecoder();
 
 // 缓存解码后的myID以避免重复计算
 const MY_ID_BYTES = (() => {
-	const myID = '78f2c50b-9062-4f73-823d-f2c15d3e332c';
-	const expectedmyID = myID.replace(/-/g, '');
-	const bytes = new Uint8Array(16);
-	for (let i = 0; i < 16; i++) {
-		bytes[i] = parseInt(expectedmyID.substr(i * 2, 2), 16);
-	}
-	return bytes;
+    const myID = '78f2c50b-9062-4f73-823d-f2c15d3e332c';
+    const expectedmyID = myID.replace(/-/g, '');
+    const bytes = new Uint8Array(16);
+    for (let i = 0; i < 16; i++) {
+        bytes[i] = parseInt(expectedmyID.substr(i * 2, 2), 16);
+    }
+    return bytes;
 })();
 
+// 辅助函数：安全转换为 Uint8Array
+function toUint8Array(data) {
+    if (!data) return null;
+    if (data instanceof Uint8Array) return data;
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    return null;
+}
+
+// 构建DNS响应 - 预分配缓冲区优化
+function buildDnsResponse(header, result, sent) {
+    if (sent) {
+        const buffer = new Uint8Array(2 + result.length);
+        buffer[0] = result.length >> 8;
+        buffer[1] = result.length & 0xff;
+        buffer.set(result, 2);
+        return buffer;
+    }
+    const buffer = new Uint8Array(header.length + 2 + result.length);
+    buffer.set(header);
+    buffer[header.length] = result.length >> 8;
+    buffer[header.length + 1] = result.length & 0xff;
+    buffer.set(result, header.length + 2);
+    return buffer;
+}
+
+const SOCKS5_METHODS = new Uint8Array([5, 2, 0, 2]);
+const SOCKS5_REQUEST_PREFIX = new Uint8Array([5, 1, 0, 3]);
+
 export default {
-	async fetch(req, env) {
-		if (req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
-			const [client, ws] = Object.values(new WebSocketPair());
-			ws.accept();
+    async fetch(req, env) {
+        if (req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+            const [client, ws] = Object.values(new WebSocketPair());
+            ws.accept();
+            ws.binaryType = 'arraybuffer';
 
-			const u = new URL(req.url);
-			// 修复处理URL编码的查询参数
-			if (u.pathname.includes('%3F')) {
-				const decoded = decodeURIComponent(u.pathname);
-				const queryIndex = decoded.indexOf('?');
-				if (queryIndex !== -1) {
-					u.search = decoded.substring(queryIndex);
-					u.pathname = decoded.substring(0, queryIndex);
-				}
-			}
+            const u = new URL(req.url);
+            // 修复处理URL编码的查询参数
+            if (u.pathname.includes('%3F')) {
+                const decoded = decodeURIComponent(u.pathname);
+                const queryIndex = decoded.indexOf('?');
+                if (queryIndex !== -1) {
+                    u.search = decoded.substring(queryIndex);
+                    u.pathname = decoded.substring(0, queryIndex);
+                }
+            }
 
-			let mode = 'd'; // default mode
-			let skJson;
-			let sParam = u.searchParams.get('s');
-			let pParam;
-			if (sParam) {
-				mode = 's';
-				skJson = getSKJson(sParam);
-			} else {
-				const gParam = u.searchParams.get('g');
-				if (gParam) {
-					sParam = gParam;
-					skJson = getSKJson(gParam);
-					mode = 'g';
-				} else {
-					pParam = u.searchParams.get('p');
-					if (pParam) {
-						mode = 'p';
-					}
-				}
-			}
+            let mode = 'd'; // default mode
+            let skJson;
+            let sParam = u.searchParams.get('s');
+            let pParam;
+            if (sParam) {
+                mode = 's';
+                skJson = getSKJson(sParam);
+            } else {
+                const gParam = u.searchParams.get('g');
+                if (gParam) {
+                    sParam = gParam;
+                    skJson = getSKJson(gParam);
+                    mode = 'g';
+                } else {
+                    pParam = u.searchParams.get('p');
+                    if (pParam) {
+                        mode = 'p';
+                    }
+                }
+            }
 
-			let remote = null, udpWriter = null, isDNS = false;
+            let remote = null, remoteWriter = null, udpWriter = null, isDNS = false;
 
-			new ReadableStream({
-				start(ctrl) {
-					ws.addEventListener('message', e => ctrl.enqueue(e.data));
-					ws.addEventListener('close', () => {
-						remote?.close();
-						ctrl.close();
-					});
-					ws.addEventListener('error', () => {
-						remote?.close();
-						ctrl.error();
-					});
+            const releaseRemoteWriter = () => {
+                if (remoteWriter) {
+                    try {
+                        remoteWriter.releaseLock();
+                    } catch { }
+                    remoteWriter = null;
+                }
+            };
 
-					const early = req.headers.get('sec-websocket-protocol');
-					if (early) {
-						try {
-							// 优化Base64解码，使用预定义的编码器
-							const binStr = atob(early.replace(/-/g, '+').replace(/_/g, '/'));
-							const buffer = new ArrayBuffer(binStr.length);
-							const arr = new Uint8Array(buffer);
-							for (let i = 0; i < binStr.length; i++) {
-								arr[i] = binStr.charCodeAt(i);
-							}
-							ctrl.enqueue(buffer);
-						} catch { }
-					}
-				}
-			}).pipeTo(new WritableStream({
-				async write(data) {
-					if (isDNS) return udpWriter?.write(data);
-					if (remote) {
-						const w = remote.writable.getWriter();
-						await w.write(data);
-						w.releaseLock();
-						return;
-					}
+            const releaseUdpWriter = () => {
+                if (udpWriter) {
+                    try {
+                        udpWriter.releaseLock();
+                    } catch { }
+                    udpWriter = null;
+                }
+            };
 
-					// 优化长度检查
-					if (data.byteLength < 24) return;
+            const terminateRemote = () => {
+                if (remote) {
+                    try {
+                        remote.close();
+                    } catch { }
+                    remote = null;
+                }
+                releaseRemoteWriter();
+            };
 
-					// 使用从环境变量获取的MY_ID_BYTES进行快速验证
-					const dataView = new DataView(data);
-					for (let i = 0; i < 16; i++) {
-						if (dataView.getUint8(1 + i) !== MY_ID_BYTES[i]) return;
-					}
+            new ReadableStream({
+                start(ctrl) {
+                    ws.addEventListener('message', e => {
+                        const { data } = e;
+                        if (typeof data === 'string') {
+                            ctrl.enqueue(te.encode(data));
+                        } else {
+                            ctrl.enqueue(data);
+                        }
+                    });
+                    ws.addEventListener('close', () => {
+                        terminateRemote();
+                        releaseUdpWriter();
+                        ctrl.close();
+                    });
+                    ws.addEventListener('error', () => {
+                        terminateRemote();
+                        releaseUdpWriter();
+                        ctrl.error();
+                    });
 
-					const optLen = dataView.getUint8(17);
-					const cmd = dataView.getUint8(18 + optLen);
-					if (cmd !== 1 && cmd !== 2) return;
+                    const early = req.headers.get('sec-websocket-protocol');
+                    if (early) {
+                        try {
+                            // 优化Base64解码，使用预定义的编码器
+                            const binStr = atob(early.replace(/-/g, '+').replace(/_/g, '/'));
+                            const buffer = new ArrayBuffer(binStr.length);
+                            const arr = new Uint8Array(buffer);
+                            for (let i = 0; i < binStr.length; i++) {
+                                arr[i] = binStr.charCodeAt(i);
+                            }
+                            ctrl.enqueue(buffer);
+                        } catch { }
+                    }
+                }
+            }).pipeTo(new WritableStream({
+                async write(data) {
+                    const chunk = toUint8Array(data);
+                    if (!chunk) return;
 
-					let pos = 19 + optLen;
-					const port = dataView.getUint16(pos);
-					const type = dataView.getUint8(pos + 2);
-					pos += 3;
+                    if (isDNS) {
+                        if (udpWriter) {
+                            try {
+                                await udpWriter.write(chunk);
+                            } catch {
+                                releaseUdpWriter();
+                            }
+                        }
+                        return;
+                    }
 
-					let addr = '';
-					if (type === 1) {
-						// 优化IPv4地址构造，避免字符串拼接
-						const ipParts = [
-							dataView.getUint8(pos),
-							dataView.getUint8(pos + 1),
-							dataView.getUint8(pos + 2),
-							dataView.getUint8(pos + 3)
-						];
-						addr = ipParts.join('.');
-						pos += 4;
-					} else if (type === 2) {
-						// 使用预定义的TextDecoder
-						const len = dataView.getUint8(pos++);
-						addr = td.decode(data.slice(pos, pos + len));
-						pos += len;
-					} else if (type === 3) {
-						// IPv6
-						const ipv6 = [];
-						for (let i = 0; i < 8; i++, pos += 2) {
-							ipv6.push(dataView.getUint16(pos).toString(16));
-						}
-						addr = ipv6.join(':');
-					} else return;
+                    if (remoteWriter) {
+                        try {
+                            await remoteWriter.write(chunk);
+                        } catch {
+                            terminateRemote();
+                        }
+                        return;
+                    }
 
-					const header = new Uint8Array([data[0], 0]);
-					const payload = data.slice(pos);
+                    if (chunk.length < 24) return;
 
-					// UDP DNS
-					if (cmd === 2) {
-						if (port !== 53) return;
-						isDNS = true;
-						let sent = false;
-						const {
-							readable,
-							writable
-						} = new TransformStream({
-							transform(chunk, ctrl) {
-								for (let i = 0; i < chunk.byteLength;) {
-									const len = new DataView(chunk.slice(i, i + 2))
-										.getUint16(0);
-									ctrl.enqueue(chunk.slice(i + 2, i + 2 + len));
-									i += 2 + len;
-								}
-							}
-						});
+                    for (let i = 0; i < 16; i++) {
+                        if (chunk[1 + i] !== MY_ID_BYTES[i]) return;
+                    }
 
-						readable.pipeTo(new WritableStream({
-							async write(query) {
-								try {
-									const resp = await fetch(
-										'https://1.1.1.1/dns-query', {
-										method: 'POST',
-										headers: {
-											'content-type': 'application/dns-message'
-										},
-										body: query
-									});
-									if (ws.readyState === 1) {
-										const result = new Uint8Array(await resp
-											.arrayBuffer());
-										ws.send(new Uint8Array([...(sent ? [] :
-											header), result
-												.length >> 8, result
-													.length & 0xff, ...result
-										]));
-										sent = true;
-									}
-								} catch { }
-							}
-						}));
-						udpWriter = writable.getWriter();
-						return udpWriter.write(payload);
-					}
+                    const optLen = chunk[17];
+                    const cmdIndex = 18 + optLen;
+                    if (cmdIndex >= chunk.length) return;
 
-					// TCP连接 - 使用优化的连接建立逻辑
-					let conn = null;
-					const connectionMethods = getOrder(mode);
+                    const cmd = chunk[cmdIndex];
+                    if (cmd !== 1 && cmd !== 2) return;
 
-					// 使用Promise.any并行尝试不同的连接方法
-					const connectionPromises = [];
-					for (const method of connectionMethods) {
-						if (method === 'd') {
-							connectionPromises.push(connectDirect(addr, port));
-						} else if (method === 's' && skJson) {
-							connectionPromises.push(sConnect(addr, port, skJson));
-						} else if (method === 'p' && pParam) {
-							const [ph, pp = port] = pParam.split(':');
-							connectionPromises.push(connectDirect(ph, +pp || port));
-						}
-					}
+                    let pos = 19 + optLen;
+                    if (pos + 3 > chunk.length) return;
 
-					try {
-						if (connectionPromises.length > 0) {
-							conn = await Promise.any(connectionPromises);
-						}
-					} catch {
-						// 所有连接尝试都失败了
-						return;
-					}
+                    const port = (chunk[pos] << 8) | chunk[pos + 1];
+                    const type = chunk[pos + 2];
+                    pos += 3;
 
-					if (!conn) return;
+                    let addr = '';
+                    if (type === 1) {
+                        if (pos + 4 > chunk.length) return;
+                        addr = `${chunk[pos]}.${chunk[pos + 1]}.${chunk[pos + 2]}.${chunk[pos + 3]}`;
+                        pos += 4;
+                    } else if (type === 2) {
+                        if (pos >= chunk.length) return;
+                        const len = chunk[pos++];
+                        if (pos + len > chunk.length) return;
+                        addr = td.decode(chunk.subarray(pos, pos + len));
+                        pos += len;
+                    } else if (type === 3) {
+                        if (pos + 16 > chunk.length) return;
+                        const ipv6 = new Array(8);
+                        for (let i = 0; i < 8; i++, pos += 2) {
+                            ipv6[i] = ((chunk[pos] << 8) | chunk[pos + 1]).toString(16);
+                        }
+                        addr = ipv6.join(':');
+                    } else {
+                        return;
+                    }
 
-					remote = conn;
-					const w = conn.writable.getWriter();
-					await w.write(payload);
-					w.releaseLock();
+                    const header = new Uint8Array([chunk[0], 0]);
+                    const payload = chunk.subarray(pos);
 
-					let sent = false;
-					conn.readable.pipeTo(new WritableStream({
-						write(chunk) {
-							if (ws.readyState === 1) {
-								ws.send(sent ? chunk : new Uint8Array([...header, ...
-									new Uint8Array(chunk)
-								]));
-								sent = true;
-							}
-						},
-						close: () => ws.readyState === 1 && ws.close(),
-						abort: () => ws.readyState === 1 && ws.close()
-					})).catch(() => { });
-				}
-			})).catch(() => { });
+                    if (cmd === 2) {
+                        if (port !== 53) return;
+                        isDNS = true;
+                        let sent = false;
+                        const { readable, writable } = new TransformStream({
+                            transform(chunkData, ctrl) {
+                                const chunkView = toUint8Array(chunkData);
+                                if (!chunkView || chunkView.length < 2) return;
+                                let offset = 0;
+                                while (offset + 2 <= chunkView.length) {
+                                    const len = (chunkView[offset] << 8) | chunkView[offset + 1];
+                                    offset += 2;
+                                    if (offset + len > chunkView.length) break;
+                                    ctrl.enqueue(chunkView.subarray(offset, offset + len));
+                                    offset += len;
+                                }
+                            }
+                        });
 
-			return new Response(null, {
-				status: 101,
-				webSocket: client
-			});
-		}
+                        readable.pipeTo(new WritableStream({
+                            async write(query) {
+                                try {
+                                    const resp = await fetch(DNS_ENDPOINT, {
+                                        method: 'POST',
+                                        headers: {
+                                            'content-type': 'application/dns-message'
+                                        },
+                                        body: query
+                                    });
+                                    if (ws.readyState !== 1) return;
+                                    const result = toUint8Array(await resp.arrayBuffer());
+                                    if (!result) return;
+                                    ws.send(buildDnsResponse(header, result, sent));
+                                    sent = true;
+                                } catch { }
+                            }
+                        }));
+                        udpWriter = writable.getWriter();
+                        try {
+                            await udpWriter.write(payload);
+                        } catch {
+                            releaseUdpWriter();
+                        }
+                        return;
+                    }
 
-		return new Response("Hello World", { status: 200 });
-	}
+                    let conn = null;
+                    const connectionMethods = getOrder(mode);
+                    const connectionPromises = [];
+                    for (const method of connectionMethods) {
+                        if (method === 'd') {
+                            connectionPromises.push(connectDirect(addr, port));
+                        } else if (method === 's' && skJson) {
+                            connectionPromises.push(sConnect(addr, port, skJson));
+                        } else if (method === 'p' && pParam) {
+                            const [ph, pp = port] = pParam.split(':');
+                            if (ph) {
+                                connectionPromises.push(connectDirect(ph, +pp || port));
+                            }
+                        }
+                    }
+
+                    try {
+                        if (connectionPromises.length) {
+                            conn = await Promise.any(connectionPromises);
+                        }
+                    } catch {
+                        return;
+                    }
+
+                    if (!conn) return;
+
+                    remote = conn;
+                    try {
+                        remoteWriter = conn.writable.getWriter();
+                        await remoteWriter.write(payload);
+                    } catch {
+                        terminateRemote();
+                        return;
+                    }
+
+                    let sent = false;
+                    conn.readable.pipeTo(new WritableStream({
+                        write(chunkData) {
+                            if (ws.readyState !== 1) return;
+                            const chunkView = toUint8Array(chunkData);
+                            if (!chunkView || !chunkView.length) return;
+
+                            if (!sent) {
+                                const combined = new Uint8Array(header.length + chunkView.length);
+                                combined.set(header);
+                                combined.set(chunkView, header.length);
+                                ws.send(combined);
+                                sent = true;
+                                return;
+                            }
+
+                            ws.send(chunkView);
+                        },
+                        close: () => {
+                            sent = true;
+                            ws.readyState === 1 && ws.close();
+                            releaseRemoteWriter();
+                            remote = null;
+                        },
+                        abort: () => {
+                            sent = true;
+                            ws.readyState === 1 && ws.close();
+                            releaseRemoteWriter();
+                            remote = null;
+                        }
+                    })).catch(() => {
+                        ws.readyState === 1 && ws.close();
+                        releaseRemoteWriter();
+                        remote = null;
+                    });
+                }
+            })).catch(() => { });
+
+            return new Response(null, {
+                status: 101,
+                webSocket: client
+            });
+        }
+
+        return new Response("Hello World", { status: 200 });
+    }
 };
 
 // 优化：直接连接函数
 async function connectDirect(hostname, port) {
-	const conn = connect({ hostname, port });
-	await conn.opened;
-	return conn;
+    const conn = connect({ hostname, port });
+    await conn.opened;
+    return conn;
 }
 
-function getSKJson(path) {
-	if (!path.includes('@')) return null;
+const SK_CACHE = new Map();
 
-	const [cred, server] = path.split('@');
-	const [user, pass] = cred.split(':');
-	const [host, port = 443] = server.split(':');
-	// 使用预定义的TextEncoder
-	const userEncoded = user ? te.encode(user) : null;
-	const passEncoded = pass ? te.encode(pass) : null;
-	return {
-		user,
-		pass,
-		host,
-		port: +port,
-		userEncoded,
-		passEncoded
-	};
+function getSKJson(path) {
+    if (!path.includes('@')) return null;
+
+    const cached = SK_CACHE.get(path);
+    if (cached) return cached;
+
+    const [cred, server] = path.split('@');
+    const [user, pass] = cred.split(':');
+    const [host, port = 443] = server.split(':');
+    const hasUser = typeof user === 'string' && user.length > 0;
+    const result = {
+        user,
+        pass,
+        host,
+        port: +port,
+        userEncoded: hasUser ? te.encode(user) : null,
+        passEncoded: hasUser ? te.encode(pass ?? '') : null
+    };
+
+    SK_CACHE.set(path, result);
+    return result;
 }
 
 // 优化getOrder函数 - 使用缓存避免重复创建数组
 const orderCache = {
-	'p': ['d', 'p'],
-	's': ['d', 's'],
-	'g': ['s'],
-	'default': ['d']
+    'p': ['d', 'p'],
+    's': ['d', 's'],
+    'g': ['s'],
+    'default': ['d']
 };
 
 function getOrder(mode) {
-	return orderCache[mode] || orderCache['default'];
+    return orderCache[mode] || orderCache['default'];
 }
 
-// SK连接
 async function sConnect(targetHost, targetPort, skJson) {
-	const conn = connect({
-		hostname: skJson.host,
-		port: skJson.port
-	});
-	await conn.opened;
-	const w = conn.writable.getWriter();
-	const r = conn.readable.getReader();
-	await w.write(new Uint8Array([5, 2, 0, 2]));
-	const auth = (await r.read()).value;
-	if (auth[1] === 2 && skJson.user) {
-		// 使用预编码的凭证
-		await w.write(new Uint8Array([1, skJson.userEncoded.length, ...skJson.userEncoded, skJson.passEncoded.length, ...skJson.passEncoded]));
-		await r.read();
-	}
-	const domain = te.encode(targetHost); // 使用预定义的TextEncoder
-	await w.write(new Uint8Array([5, 1, 0, 3, domain.length, ...domain, targetPort >> 8,
-		targetPort & 0xff
-	]));
-	await r.read();
-	w.releaseLock();
-	r.releaseLock();
-	return conn;
-};
+    const conn = connect({
+        hostname: skJson.host,
+        port: skJson.port
+    });
+    await conn.opened;
+    const w = conn.writable.getWriter();
+    const r = conn.readable.getReader();
+
+    try {
+        await w.write(SOCKS5_METHODS);
+        const authResp = await r.read();
+        const auth = toUint8Array(authResp.value);
+        if (!auth || auth.length < 2) {
+            throw new Error('Invalid SOCKS5 auth response');
+        }
+
+        if (auth[1] === 2 && skJson.userEncoded) {
+            const passBytes = skJson.passEncoded ?? new Uint8Array(0);
+            const authBuffer = new Uint8Array(3 + skJson.userEncoded.length + passBytes.length);
+            authBuffer[0] = 1;
+            authBuffer[1] = skJson.userEncoded.length;
+            authBuffer.set(skJson.userEncoded, 2);
+            authBuffer[2 + skJson.userEncoded.length] = passBytes.length;
+            authBuffer.set(passBytes, 3 + skJson.userEncoded.length);
+            await w.write(authBuffer);
+            await r.read();
+        }
+
+        const domain = te.encode(targetHost);
+        const reqBuffer = new Uint8Array(SOCKS5_REQUEST_PREFIX.length + 1 + domain.length + 2);
+        reqBuffer.set(SOCKS5_REQUEST_PREFIX);
+        reqBuffer[SOCKS5_REQUEST_PREFIX.length] = domain.length;
+        reqBuffer.set(domain, SOCKS5_REQUEST_PREFIX.length + 1);
+        reqBuffer[reqBuffer.length - 2] = targetPort >> 8;
+        reqBuffer[reqBuffer.length - 1] = targetPort & 0xff;
+        await w.write(reqBuffer);
+        await r.read();
+
+        return conn;
+    } catch (err) {
+        try {
+            conn.close();
+        } catch { }
+        throw err;
+    } finally {
+        w.releaseLock();
+        r.releaseLock();
+    }
+}
