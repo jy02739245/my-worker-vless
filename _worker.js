@@ -4,7 +4,9 @@ export default {
   async fetch(访问请求) {
     const url = new URL(访问请求.url);
     反代IP = url.searchParams.get('ip') || 反代IP;
-    if (访问请求.headers.get('Upgrade') === 'websocket') {
+    const 升级头信息 = 访问请求.headers.get('Upgrade');
+    const 是否WS升级 = 升级头信息 && 升级头信息.split(',').some(item => item.trim().toLowerCase() === 'websocket');
+    if (是否WS升级) {
       return await 升级WS请求(访问请求)
     } else {
       return new Response(null, { status: 400 })
