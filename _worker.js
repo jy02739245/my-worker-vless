@@ -255,7 +255,7 @@ export default {
                                     if (ws.readyState !== 1) return;
                                     const result = toUint8Array(await resp.arrayBuffer());
                                     if (!result) return;
-                                    ws.send(buildDnsResponse(header, result, sent));
+                                    await ws.send(buildDnsResponse(header, result, sent));
                                     sent = true;
                                 } catch { }
                             }
@@ -306,7 +306,7 @@ export default {
 
                     let sent = false;
                     conn.readable.pipeTo(new WritableStream({
-                        write(chunkData) {
+                        async write(chunkData) {
                             if (ws.readyState !== 1) return;
                             const chunkView = toUint8Array(chunkData);
                             if (!chunkView || !chunkView.length) return;
@@ -315,12 +315,12 @@ export default {
                                 const combined = new Uint8Array(header.length + chunkView.length);
                                 combined.set(header);
                                 combined.set(chunkView, header.length);
-                                ws.send(combined);
+                                await ws.send(combined);
                                 sent = true;
                                 return;
                             }
 
-                            ws.send(chunkView);
+                            await ws.send(chunkView);
                         },
                         close: () => {
                             sent = true;
