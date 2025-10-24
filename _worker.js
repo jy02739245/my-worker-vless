@@ -14,14 +14,30 @@ export default {
 ////////////////////////////////////////////////////////////////////////脚本主要架构//////////////////////////////////////////////////////////////////////
 //第一步，读取和构建基础访问结构
 async function 升级WS请求(访问请求) {
+  const 原始协议头 = 访问请求.headers.get('sec-websocket-protocol') || '';
+  const 协议标头列表 = 原始协议头.split(',').map(item => item.trim()).filter(Boolean);
+  const 读取我的加密访问内容数据头 = (协议标头列表.find(item => item.length >= 16 && /^[A-Za-z0-9+/_-]+={0,2}$/.test(item)) ?? 协议标头列表[0]); //读取访问标头中的WS通信数据
+  if (!读取我的加密访问内容数据头) {
+    return new Response('缺少认证信息', { status: 400 });
+  }
+  let 解密数据;
+  try {
+    解密数据 = 使用64位加解密(读取我的加密访问内容数据头); //解密目标访问数据，传递给TCP握手进程
+  } catch {
+    return new Response('认证信息无效', { status: 400 });
+  }
   const 创建WS接口 = new WebSocketPair();
   const [客户端, WS接口] = Object.values(创建WS接口);
-  const 读取我的加密访问内容数据头 = 访问请求.headers.get('sec-websocket-protocol'); //读取访问标头中的WS通信数据
-  const 解密数据 = 使用64位加解密(读取我的加密访问内容数据头); //解密目标访问数据，传递给TCP握手进程
-  await 解析VL标头(解密数据, WS接口); //解析VL数据并进行TCP握手
+  const 结果 = await 解析VL标头(解密数据, WS接口); //解析VL数据并进行TCP握手
+  if (结果 instanceof Response) {
+    return 结果; //如果解析失败，返回错误响应
+  }
   return new Response(null, { status: 101, webSocket: 客户端 }); //一切准备就绪后，回复客户端WS连接升级成功
 }
 function 使用64位加解密(还原混淆字符) {
+  if (typeof 还原混淆字符 !== 'string' || 还原混淆字符.length === 0) {
+    throw new Error('Invalid base64 input');
+  }
   还原混淆字符 = 还原混淆字符.replace(/-/g, '+').replace(/_/g, '/');
   const 解密数据 = atob(还原混淆字符);
   const 解密_你_个_丁咚_咙_咚呛 = Uint8Array.from(解密数据, (c) => c.charCodeAt(0));
@@ -70,7 +86,7 @@ async function 解析VL标头(VL数据, WS接口, TCP接口) {
   try {
     await TCP接口.opened;
   } catch {
-    return new Reaponse('连接握手失败', { status: 400 });
+    return new Response('连接握手失败', { status: 400 });
   }
   建立传输管道(WS接口, TCP接口, 写入初始数据); //建立WS接口与TCP接口的传输管道
 }
