@@ -46,6 +46,31 @@ function buildDnsResponse(header, result, sent) {
     return buffer;
 }
 
+const FLOW_CONTROL_DELAY_STEPS = [
+    { size: 1 * 1024 * 1024, delay: 320 },
+    { size: 50 * 1024 * 1024, delay: 340 },
+    { size: 100 * 1024 * 1024, delay: 360 },
+    { size: 200 * 1024 * 1024, delay: 400 }
+];
+const FLOW_CONTROL_DEFAULT_DELAY = 300;
+const FLOW_CONTROL_THRESHOLD = 4 * 1024 * 1024;
+const FLOW_CONTROL_EXTRA_DELAY = 500;
+const FLOW_CONTROL_CLEANUP_DELAY = 1000;
+
+function getFlowControlDelay(totalBytes) {
+    for (let i = FLOW_CONTROL_DELAY_STEPS.length - 1; i >= 0; i--) {
+        const step = FLOW_CONTROL_DELAY_STEPS[i];
+        if (totalBytes >= step.size) {
+            return step.delay;
+        }
+    }
+    return FLOW_CONTROL_DEFAULT_DELAY;
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 const SOCKS5_METHODS = new Uint8Array([5, 2, 0, 2]);
 const SOCKS5_REQUEST_PREFIX = new Uint8Array([5, 1, 0, 3]);
 
@@ -305,40 +330,59 @@ export default {
                     }
 
                     let sent = false;
-                    conn.readable.pipeTo(new WritableStream({
-                        write(chunkData) {
-                            if (ws.readyState !== 1) return;
-                            const chunkView = toUint8Array(chunkData);
-                            if (!chunkView || !chunkView.length) return;
+                    let totalBytesReceived = 0;
+                    let lastDelayCheckpoint = 0;
+                    let shouldCloseWS = false;
+                    const reader = conn.readable.getReader();
 
-                            if (!sent) {
-                                const combined = new Uint8Array(header.length + chunkView.length);
-                                combined.set(header);
-                                combined.set(chunkView, header.length);
-                                ws.send(combined);
-                                sent = true;
-                                return;
+                    (async () => {
+                        try {
+                            while (true) {
+                                const { done, value } = await reader.read();
+
+                                if (done) {
+                                    sent = true;
+                                    shouldCloseWS = ws.readyState === 1;
+                                    break;
+                                }
+
+                                const chunkView = toUint8Array(value);
+                                if (!chunkView || !chunkView.length) continue;
+
+                                if (ws.readyState !== 1) break;
+
+                                totalBytesReceived += chunkView.length;
+
+                                if (!sent) {
+                                    const combined = new Uint8Array(header.length + chunkView.length);
+                                    combined.set(header);
+                                    combined.set(chunkView, header.length);
+                                    ws.send(combined);
+                                    sent = true;
+                                } else {
+                                    ws.send(chunkView);
+                                }
+
+                                if ((totalBytesReceived - lastDelayCheckpoint) > FLOW_CONTROL_THRESHOLD) {
+                                    const currentDelay = getFlowControlDelay(totalBytesReceived);
+                                    await sleep(currentDelay + FLOW_CONTROL_EXTRA_DELAY);
+                                    lastDelayCheckpoint = totalBytesReceived;
+                                }
                             }
-
-                            ws.send(chunkView);
-                        },
-                        close: () => {
+                        } catch (error) {
                             sent = true;
-                            ws.readyState === 1 && ws.close();
-                            releaseRemoteWriter();
-                            remote = null;
-                        },
-                        abort: () => {
-                            sent = true;
-                            ws.readyState === 1 && ws.close();
-                            releaseRemoteWriter();
-                            remote = null;
+                            shouldCloseWS = ws.readyState === 1;
+                        } finally {
+                            await sleep(FLOW_CONTROL_CLEANUP_DELAY);
+                            if (shouldCloseWS && ws.readyState === 1) {
+                                ws.close();
+                            }
+                            try {
+                                reader.releaseLock();
+                            } catch {}
+                            terminateRemote();
                         }
-                    })).catch(() => {
-                        ws.readyState === 1 && ws.close();
-                        releaseRemoteWriter();
-                        remote = null;
-                    });
+                    })();
                 }
             })).catch(() => { });
 
